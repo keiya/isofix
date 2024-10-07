@@ -4,6 +4,11 @@ import Photos
 
 struct ContentView: View {
     @StateObject private var cameraModel = CameraModel()
+    @State private var exposureDurationIndex: Double = 6 // デフォルトのシャッター速度インデックス (1/60に相当)
+    
+    let exposureDurations: [Double] = [
+        1/1000, 1/500, 1/250, 1/125, 1/60, 1/30, 1/15, 1/8, 1/4, 1/2, 1
+    ]
     
     var body: some View {
         ZStack {
@@ -38,6 +43,19 @@ struct ContentView: View {
                     }
                 }
                 .padding(.bottom)
+
+                // シャッター速度スライダー
+                Slider(value: $exposureDurationIndex, in: 0...Double(exposureDurations.count - 1), step: 1) { _ in
+                    let duration = exposureDurations[Int(exposureDurationIndex)]
+                    cameraModel.setExposureDuration(duration)
+                }
+                .padding()
+                .background(Color.black.opacity(0.7))
+                .foregroundColor(.white)
+                
+                Text("1/\(Int(1/exposureDurations[Int(exposureDurationIndex)]))")
+                    .foregroundColor(.white)
+                    .padding(.bottom)
             }
         }
         .gesture(
@@ -121,16 +139,15 @@ class CameraModel: NSObject, ObservableObject, AVCapturePhotoCaptureDelegate {
         currentDevice = backCamera
         
         do {
-            // 最高品質の設定を選択
-            if let highestQualityFormat = backCamera.formats
-                .filter({ $0.isVideoStabilizationModeSupported(.auto) })
+            // Select the highest resolution format
+            if let highestResolutionFormat = backCamera.formats
                 .max(by: { first, second in
                     let firstDimensions = CMVideoFormatDescriptionGetDimensions(first.formatDescription)
                     let secondDimensions = CMVideoFormatDescriptionGetDimensions(second.formatDescription)
                     return firstDimensions.width * firstDimensions.height < secondDimensions.width * secondDimensions.height
                 }) {
                 try backCamera.lockForConfiguration()
-                backCamera.activeFormat = highestQualityFormat
+                backCamera.activeFormat = highestResolutionFormat
                 backCamera.unlockForConfiguration()
             }
 
@@ -138,10 +155,10 @@ class CameraModel: NSObject, ObservableObject, AVCapturePhotoCaptureDelegate {
             if session.canAddInput(input) {
                 session.addInput(input)
             }
-            
+
             if session.canAddOutput(photoOutput) {
                 session.addOutput(photoOutput)
-                
+
                 // ProRAWのサポートを確認
                 if photoOutput.isAppleProRAWSupported {
                     photoOutput.isAppleProRAWEnabled = true
@@ -150,32 +167,42 @@ class CameraModel: NSObject, ObservableObject, AVCapturePhotoCaptureDelegate {
                 } else {
                     print("Apple ProRAW is not supported on this device")
                 }
+
+                // 最大解像度の設定
+                if let maxDimensions = backCamera.activeFormat.supportedMaxPhotoDimensions.max(by: { $0.width * $0.height < $1.width * $1.height }) {
+                    photoOutput.maxPhotoDimensions = maxDimensions
+                    print("Setting max photo dimensions to: \(maxDimensions.width)x\(maxDimensions.height)")
+                } else {
+                    print("Unable to determine max photo dimensions")
+                }
             }
-            
+
             // Debug: Print all available RAW photo pixel format types
             print("Available RAW Photo Pixel Format Types: \(photoOutput.availableRawPhotoPixelFormatTypes)")
 
             // Check for supported RAW formats
             if let rawFormat = photoOutput.availableRawPhotoPixelFormatTypes.first {
-                // Optionally, set max dimensions based on RAW format capabilities
-                photoOutput.maxPhotoDimensions = CMVideoDimensions(width: 4032, height: 3024)
+                // Set max dimensions based on RAW format capabilities
+                let dimensions = CMVideoFormatDescriptionGetDimensions(backCamera.activeFormat.formatDescription)
+                photoOutput.maxPhotoDimensions = CMVideoDimensions(width: Int32(dimensions.width), height: Int32(dimensions.height))
+                print("Setting max photo dimensions to: \(dimensions.width)x\(dimensions.height)")
             }
-            
+
             try backCamera.lockForConfiguration()
-            
+
             // ISOを最小に設定
             if backCamera.isExposureModeSupported(.custom) {
                 backCamera.setExposureModeCustom(duration: backCamera.exposureDuration, iso: backCamera.activeFormat.minISO, completionHandler: nil)
             } else {
                 print("Custom exposure mode is not supported on this device")
             }
-            
+
             // ズームレベルの設定
             availableZoomFactors = [1.0] + backCamera.virtualDeviceSwitchOverVideoZoomFactors.map { CGFloat($0.doubleValue) }
             availableZoomFactors = Array(Set(availableZoomFactors)).sorted()
-            
+
             backCamera.unlockForConfiguration()
-            
+
             session.startRunning()
         } catch {
             print("Error setting up camera: \(error.localizedDescription)")
@@ -208,34 +235,25 @@ class CameraModel: NSObject, ObservableObject, AVCapturePhotoCaptureDelegate {
     
     func capturePhoto() {
         let settings: AVCapturePhotoSettings
-        
-        if isProRAWEnabled {
-            // ProRAWフォーマットを使用
-            guard let proRAWFormat = photoOutput.availableRawPhotoPixelFormatTypes.first(where: { AVCapturePhotoOutput.isAppleProRAWPixelFormat($0) }) else {
-                print("ProRAW format not available")
-                return
-            }
+
+        if isProRAWEnabled, let proRAWFormat = photoOutput.availableRawPhotoPixelFormatTypes.first(where: { AVCapturePhotoOutput.isAppleProRAWPixelFormat($0) }) {
             settings = AVCapturePhotoSettings(rawPixelFormatType: proRAWFormat)
         } else if let rawFormat = photoOutput.availableRawPhotoPixelFormatTypes.first {
-            // 通常のRAWフォーマットを使用
             settings = AVCapturePhotoSettings(rawPixelFormatType: rawFormat)
         } else {
-            // RAWがサポートされていない場合はHEIFで撮影
             settings = AVCapturePhotoSettings(format: [AVVideoCodecKey: AVVideoCodecType.hevc])
         }
-        
-        if let device = currentDevice {
-            let dimensions = CMVideoFormatDescriptionGetDimensions(device.activeFormat.formatDescription)
-            settings.maxPhotoDimensions = CMVideoDimensions(width: dimensions.width, height: dimensions.height)
-            print("Setting max photo dimensions to: \(dimensions.width)x\(dimensions.height)")
-        }
-        
+
+        // 最大解像度の設定
+        settings.maxPhotoDimensions = photoOutput.maxPhotoDimensions
+        print("Capturing photo with dimensions: \(settings.maxPhotoDimensions.width)x\(settings.maxPhotoDimensions.height)")
+
         settings.flashMode = .off
-        
+
         // Ensure photo quality prioritization does not exceed the maximum supported
         let maxQuality = photoOutput.maxPhotoQualityPrioritization
         settings.photoQualityPrioritization = (maxQuality.rawValue < AVCapturePhotoOutput.QualityPrioritization.quality.rawValue) ? maxQuality : .quality
-        
+
         photoOutput.capturePhoto(with: settings, delegate: self)
     }
     
@@ -359,6 +377,18 @@ class CameraModel: NSObject, ObservableObject, AVCapturePhotoCaptureDelegate {
 
         } catch {
             print("Error switching camera: \(error.localizedDescription)")
+        }
+    }
+
+    func setExposureDuration(_ duration: Double) {
+        guard let device = currentDevice else { return }
+        do {
+            try device.lockForConfiguration()
+            let newDuration = CMTime(seconds: duration, preferredTimescale: 1000000)
+            device.setExposureModeCustom(duration: newDuration, iso: device.iso, completionHandler: nil)
+            device.unlockForConfiguration()
+        } catch {
+            print("Error setting exposure duration: \(error.localizedDescription)")
         }
     }
 }
